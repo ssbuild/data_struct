@@ -1,16 +1,15 @@
 #if 1
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #define ORDER 4
-#define MIN_KEYS ((ORDER + 1) / 2 - 1)  // 最小键数要求（ORDER=4 → 1）
+#define MIN_KEYS ((ORDER + 1) / 2 - 1)  // ORDER=4 → 1
 
 typedef struct BPlusNode {
     int keys[ORDER - 1];
     struct BPlusNode* children[ORDER];
-    struct BPlusNode* next;         // 只在叶子节点使用
+    struct BPlusNode* next;     // 仅叶子使用
     int num_keys;
     int is_leaf;
 } BPlusNode;
@@ -37,11 +36,12 @@ BPlusTree* create_tree() {
     return tree;
 }
 
-// 查找叶子节点并记录路径
+// 查找叶子节点，path 只记录非叶子节点
 BPlusNode* find_leaf(BPlusTree* tree, int key, BPlusNode*** path, int* depth) {
     BPlusNode* cur = tree->root;
     *depth = 0;
     *path = (BPlusNode**)malloc(sizeof(BPlusNode*) * 64);
+    if (!*path) return NULL;
 
     while (!cur->is_leaf) {
         (*path)[(*depth)++] = cur;
@@ -58,41 +58,32 @@ int find_pos(BPlusNode* node, int key) {
     return i;
 }
 
-// 分裂叶子，返回上升的键（新节点最小键）
+// 分裂叶子节点，返回新节点的最小键（用于插入父节点）
 int split_leaf(BPlusNode* leaf, BPlusNode** new_leaf) {
     *new_leaf = create_node(1);
-    int mid = (ORDER - 1) / 2;  // 1 for ORDER=4
-
+    int mid = (ORDER - 1) / 2;
     for (int i = mid; i < ORDER - 1; i++) {
         (*new_leaf)->keys[(*new_leaf)->num_keys++] = leaf->keys[i];
     }
-
     leaf->num_keys = mid;
-
     (*new_leaf)->next = leaf->next;
     leaf->next = *new_leaf;
-
     return (*new_leaf)->keys[0];
 }
 
-// 分裂内部节点，返回上升的键
+// 分裂内部节点，返回中间键（上升键）
 int split_internal(BPlusNode* node, BPlusNode** new_node) {
     *new_node = create_node(0);
     int mid = (ORDER - 1) / 2;
-
     int up_key = node->keys[mid];
-
     for (int i = mid + 1; i < ORDER - 1; i++) {
         (*new_node)->keys[(*new_node)->num_keys++] = node->keys[i];
     }
-
     for (int i = mid + 1; i < ORDER; i++) {
         (*new_node)->children[i - mid - 1] = node->children[i];
         node->children[i] = NULL;
     }
-
     node->num_keys = mid;
-
     return up_key;
 }
 
@@ -106,14 +97,11 @@ void insert_into_parent(BPlusTree* tree, BPlusNode* parent, int up_key, BPlusNod
         tree->root = new_root;
         return;
     }
-
     int pos = find_pos(parent, up_key);
-
     for (int i = parent->num_keys; i > pos; i--)
         parent->keys[i] = parent->keys[i - 1];
     parent->keys[pos] = up_key;
     parent->num_keys++;
-
     for (int i = parent->num_keys; i > pos + 1; i--)
         parent->children[i] = parent->children[i - 1];
     parent->children[pos + 1] = right;
@@ -122,11 +110,9 @@ void insert_into_parent(BPlusTree* tree, BPlusNode* parent, int up_key, BPlusNod
 // 插入
 void insert(BPlusTree* tree, int key) {
     if (!tree || !tree->root) return;
-
     int depth;
     BPlusNode** path;
     BPlusNode* leaf = find_leaf(tree, key, &path, &depth);
-
     int pos = find_pos(leaf, key);
     for (int i = leaf->num_keys; i > pos; i--)
         leaf->keys[i] = leaf->keys[i - 1];
@@ -135,11 +121,9 @@ void insert(BPlusTree* tree, int key) {
 
     BPlusNode* current = leaf;
     int cur_depth = depth;
-
     while (current->num_keys == ORDER - 1) {
         BPlusNode* new_sibling;
         int up_key;
-
         if (current->is_leaf)
             up_key = split_leaf(current, &new_sibling);
         else
@@ -149,151 +133,145 @@ void insert(BPlusTree* tree, int key) {
             insert_into_parent(tree, NULL, up_key, new_sibling);
             break;
         }
-
         BPlusNode* parent = path[--cur_depth];
         insert_into_parent(tree, parent, up_key, new_sibling);
         current = parent;
     }
-
     free(path);
 }
 
-// -------------------------- 删除相关辅助函数 --------------------------
+// ──────────────── 删除相关 ────────────────
 
-// 从叶子删除指定位置的键
 void remove_from_leaf(BPlusNode* leaf, int pos) {
     for (int i = pos; i < leaf->num_keys - 1; i++)
         leaf->keys[i] = leaf->keys[i + 1];
     leaf->num_keys--;
 }
 
-// 从内部节点删除指定位置的键，并调整孩子指针
 void remove_from_internal(BPlusNode* node, int pos) {
     for (int i = pos; i < node->num_keys - 1; i++)
         node->keys[i] = node->keys[i + 1];
     node->num_keys--;
-
-    // 孩子指针向左移动（删除的是第pos个分隔符，右边的孩子要前移）
     for (int i = pos + 1; i <= node->num_keys; i++)
         node->children[i] = node->children[i + 1];
 }
 
-// 查找兄弟节点并返回可借键的兄弟（左优先）
-BPlusNode* get_sibling(BPlusNode** path, int depth, int* sibling_idx) {
-    if (depth <= 0) return NULL;
+// 查找可借用的兄弟（键数 > MIN_KEYS），优先左兄弟
+BPlusNode* get_borrowable_sibling(BPlusNode** path, int depth, BPlusNode* current, int* sibling_idx) {
+    if (depth <= 0) {
+        *sibling_idx = -1;
+        return NULL;
+    }
     BPlusNode* parent = path[depth - 1];
     int child_idx = -1;
-
     for (int i = 0; i <= parent->num_keys; i++) {
-        if (parent->children[i] == path[depth]) {
+        if (parent->children[i] == current) {
             child_idx = i;
             break;
         }
     }
+    if (child_idx == -1) {
+        *sibling_idx = -1;
+        return NULL;
+    }
 
-    if (child_idx == -1) return NULL;
-
-    // 优先左兄弟
+    // 左兄弟
     if (child_idx > 0) {
-        *sibling_idx = child_idx - 1;
-        return parent->children[child_idx - 1];
+        BPlusNode* sib = parent->children[child_idx - 1];
+        if (sib->num_keys > MIN_KEYS) {
+            *sibling_idx = child_idx - 1;
+            return sib;
+        }
     }
-    // 否则右兄弟
+    // 右兄弟
     if (child_idx < parent->num_keys) {
-        *sibling_idx = child_idx + 1;
-        return parent->children[child_idx + 1];
+        BPlusNode* sib = parent->children[child_idx + 1];
+        if (sib->num_keys > MIN_KEYS) {
+            *sibling_idx = child_idx + 1;
+            return sib;
+        }
     }
-
+    *sibling_idx = -1;
     return NULL;
 }
 
-// 从兄弟节点借一个键（叶子或内部）
+// 从兄弟借键
 void borrow_from_sibling(BPlusNode* parent, int child_idx, BPlusNode* child, BPlusNode* sibling, int sibling_idx) {
     if (sibling_idx < child_idx) {
-        // 左兄弟借 → 右移
+        // 左兄弟 → 借最大键
         if (child->is_leaf) {
-            // 叶子：把左兄弟最大键移到当前节点最前面
             for (int i = child->num_keys; i > 0; i--)
                 child->keys[i] = child->keys[i - 1];
             child->keys[0] = sibling->keys[sibling->num_keys - 1];
-            child->num_keys++;
             sibling->num_keys--;
-
-            // 更新父节点分隔符（左兄弟最大键）
+            child->num_keys++;
             parent->keys[child_idx - 1] = child->keys[0];
         }
         else {
-            // 内部节点：把左兄弟最大键 + 右孩子移过来
-            child->keys[0] = parent->keys[child_idx - 1];
-            child->num_keys++;
-
-            for (int i = child->num_keys; i > 1; i--)
+            // 内部节点：下降父键到 child 最前，左兄弟最右孩子接过来
+            for (int i = child->num_keys; i > 0; i--)
+                child->keys[i] = child->keys[i - 1];
+            for (int i = child->num_keys + 1; i > 0; i--)
                 child->children[i] = child->children[i - 1];
-            child->children[1] = child->children[0];
-            child->children[0] = sibling->children[sibling->num_keys + 1];
-            sibling->children[sibling->num_keys + 1] = NULL;
+
+            child->keys[0] = parent->keys[child_idx - 1];
+            child->children[0] = sibling->children[sibling->num_keys];
+            sibling->children[sibling->num_keys] = NULL;
 
             parent->keys[child_idx - 1] = sibling->keys[sibling->num_keys - 1];
             sibling->num_keys--;
+            child->num_keys++;
         }
     }
     else {
-        // 右兄弟借 → 左移
+        // 右兄弟 → 借最小键
         if (child->is_leaf) {
-            child->keys[child->num_keys] = sibling->keys[0];
-            child->num_keys++;
+            child->keys[child->num_keys++] = sibling->keys[0];
             for (int i = 0; i < sibling->num_keys - 1; i++)
                 sibling->keys[i] = sibling->keys[i + 1];
             sibling->num_keys--;
-
             parent->keys[child_idx] = sibling->keys[0];
         }
         else {
             child->keys[child->num_keys] = parent->keys[child_idx];
-            child->num_keys++;
-            child->children[child->num_keys] = sibling->children[0];
+            child->children[child->num_keys + 1] = sibling->children[0];
 
             parent->keys[child_idx] = sibling->keys[0];
-
             for (int i = 0; i < sibling->num_keys - 1; i++)
                 sibling->keys[i] = sibling->keys[i + 1];
             for (int i = 0; i < sibling->num_keys; i++)
                 sibling->children[i] = sibling->children[i + 1];
+            sibling->children[sibling->num_keys] = NULL;
+
             sibling->num_keys--;
+            child->num_keys++;
         }
     }
 }
 
-// 合并两个节点（把 right 合并到 left）
-void merge_nodes(BPlusTree* tree, BPlusNode* parent, int left_idx, BPlusNode* left, BPlusNode* right) {
+// 合并 right 到 left
+void merge_nodes(BPlusTree* tree, BPlusNode* parent, int merge_idx, BPlusNode* left, BPlusNode* right) {
     if (left->is_leaf) {
-        // 叶子合并
         for (int i = 0; i < right->num_keys; i++)
             left->keys[left->num_keys++] = right->keys[i];
-
         left->next = right->next;
-
-        // 释放 right
-        free(right);
     }
     else {
-        // 内部节点合并：中间要带上父节点的下降键
-        left->keys[left->num_keys++] = parent->keys[left_idx];
+        int old = left->num_keys;
+        left->keys[old] = parent->keys[merge_idx];
+        left->num_keys = old + 1 + right->num_keys;
 
         for (int i = 0; i < right->num_keys; i++)
-            left->keys[left->num_keys++] = right->keys[i];
+            left->keys[old + 1 + i] = right->keys[i];
 
         for (int i = 0; i <= right->num_keys; i++)
-            left->children[left->num_keys - i] = right->children[i];  // 注意顺序
-
-        free(right);
+            left->children[old + 1 + i] = right->children[i];
     }
-
-    // 从父节点删除分隔符
-    remove_from_internal(parent, left_idx);
+    free(right);
+    remove_from_internal(parent, merge_idx);
 }
 
-// 删除实现
+// 删除
 void delete_key(BPlusTree* tree, int key) {
     if (!tree || !tree->root) return;
 
@@ -301,31 +279,18 @@ void delete_key(BPlusTree* tree, int key) {
     BPlusNode** path;
     BPlusNode* leaf = find_leaf(tree, key, &path, &depth);
 
-    // 找到要删除的位置
     int pos = 0;
     while (pos < leaf->num_keys && leaf->keys[pos] < key) pos++;
     if (pos >= leaf->num_keys || leaf->keys[pos] != key) {
         free(path);
-        return;  // 不存在
+        return;
     }
-
     remove_from_leaf(leaf, pos);
 
     BPlusNode* current = leaf;
     int cur_depth = depth;
 
-    // 处理 underflow
-    while (current->num_keys < MIN_KEYS && cur_depth >= 0) {
-        if (cur_depth == 0) {
-            // 根节点 underflow → 如果只有一个孩子，降层
-            if (tree->root->num_keys == 0 && !tree->root->is_leaf) {
-                BPlusNode* new_root = tree->root->children[0];
-                free(tree->root);
-                tree->root = new_root;
-            }
-            break;
-        }
-
+    while (current->num_keys < MIN_KEYS && cur_depth > 0) {
         BPlusNode* parent = path[cur_depth - 1];
         int child_idx = -1;
         for (int i = 0; i <= parent->num_keys; i++) {
@@ -334,87 +299,109 @@ void delete_key(BPlusTree* tree, int key) {
                 break;
             }
         }
+        if (child_idx == -1) break;
 
-        int sibling_idx;
-        BPlusNode* sibling = get_sibling(path, cur_depth, &sibling_idx);
+        int sib_idx = -1;
+        BPlusNode* sibling = get_borrowable_sibling(path, cur_depth, current, &sib_idx);
 
-        if (sibling && sibling->num_keys > MIN_KEYS) {
-            // 可以借用
-            borrow_from_sibling(parent, child_idx, current, sibling, sibling_idx);
-            break;  // 借完结束
+        if (sibling) {
+            borrow_from_sibling(parent, child_idx, current, sibling, sib_idx);
+            break;
+        }
+
+        // 合并
+        BPlusNode* left_node = NULL, * right_node = NULL;
+        int merge_idx = -1;
+
+        if (child_idx > 0) {
+            left_node = parent->children[child_idx - 1];
+            right_node = current;
+            merge_idx = child_idx - 1;
+        }
+        else if (child_idx < parent->num_keys) {
+            left_node = current;
+            right_node = parent->children[child_idx + 1];
+            merge_idx = child_idx;
+        }
+
+        if (left_node && right_node) {
+            merge_nodes(tree, parent, merge_idx, left_node, right_node);
+            current = left_node;
+            cur_depth--;
         }
         else {
-            // 需要合并
-            BPlusNode* left, * right;
-            int merge_idx;
+            break;
+        }
+    }
 
-            if (sibling_idx < child_idx) {
-                left = sibling;
-                right = current;
-                merge_idx = sibling_idx;
-            }
-            else {
-                left = current;
-                right = sibling ? sibling : current;  // 若无兄弟则不处理
-                merge_idx = child_idx;
-            }
-
-            if (right == current && !sibling) {
-                // 特殊情况：只有一个孩子且 underflow（根降层已处理）
-                break;
-            }
-
-            merge_nodes(tree, parent, merge_idx, left, right);
-
-            current = left;
-            cur_depth--;
+    // 处理根节点
+    if (tree->root && tree->root->num_keys == 0 && !tree->root->is_leaf) {
+        BPlusNode* old_root = tree->root;
+        BPlusNode* new_root = old_root->children[0];
+        if (new_root) {
+            tree->root = new_root;
+            free(old_root);
+        }
+        else {
+            // 极端情况：树变空
+            free(old_root);
+            tree->root = NULL;
         }
     }
 
     free(path);
 }
 
-// 打印树
+// 查找（返回包含 key 的叶子节点，或 NULL）
+BPlusNode* find_key(BPlusTree* tree, int key) {
+    if (!tree || !tree->root) return NULL;
+    int depth;
+    BPlusNode** path;
+    BPlusNode* leaf = find_leaf(tree, key, &path, &depth);
+    int pos = 0;
+    while (pos < leaf->num_keys && leaf->keys[pos] < key) pos++;
+    BPlusNode* result = (pos < leaf->num_keys && leaf->keys[pos] == key) ? leaf : NULL;
+    free(path);
+    return result;
+}
+
+// 打印（改进版，更清晰）
 void print_tree(BPlusNode* node, int level) {
     if (!node) return;
-    for (int i = 0; i < level; i++) printf("  ");
-    printf(node->is_leaf ? "L " : "I ");
-    printf("[");
+    for (int i = 0; i < level * 4; i++) printf(" ");
+    printf("%s %d keys: ", node->is_leaf ? "Leaf" : "Internal", node->num_keys);
     for (int i = 0; i < node->num_keys; i++) {
-        printf("%d", node->keys[i]);
-        if (i < node->num_keys - 1) printf(",");
+        printf("%d ", node->keys[i]);
     }
-    printf("]\n");
-
+    printf("\n");
     if (!node->is_leaf) {
-        for (int i = 0; i <= node->num_keys; i++)
+        for (int i = 0; i <= node->num_keys; i++) {
             print_tree(node->children[i], level + 1);
+        }
     }
 }
 
-// 测试
 int main() {
     BPlusTree* tree = create_tree();
-
-    int vals[] = { 1, 3, 5, 7, 10, 12, 15, 18, 20, 22, 25, 28, 30, 33, 35, 40, 45, 50 };
-    for (int v : vals) {
-        insert(tree, v);
+    int vals[] = { 1,3,5,7,10,12,15,18,20,22,25,28,30,33,35,40,45,50 };
+    for (int i = 0; i < (int)(sizeof(vals) / sizeof(vals[0])); i++) {
+        insert(tree, vals[i]);
     }
 
     printf("初始树:\n");
     print_tree(tree->root, 0);
     printf("\n");
 
-    int to_delete[] = { 12, 20, 5, 30, 1, 40, 18 };
-    for (int d : to_delete) {
-        printf("删除 %d 后:\n", d);
+    int deletes[] = { 12, 20, 5, 30, 1, 40, 18 };
+    for (int i = 0; i < (int)(sizeof(deletes) / sizeof(deletes[0])); i++) {
+        int d = deletes[i];
+        printf("删除 %d 前查找: %p\n", d, find_key(tree, d));
         delete_key(tree, d);
+        printf("删除 %d 后查找: %p\n", d, find_key(tree, d));
         print_tree(tree->root, 0);
-        printf("\n");
+        printf("───────────────────────\n");
     }
 
     return 0;
 }
-
 #endif
-
